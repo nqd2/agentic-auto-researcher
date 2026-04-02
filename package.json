@@ -1,0 +1,32 @@
+{
+  "name": "agentic-auto-researcher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "aar": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun run src/cli.ts start",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@qdrant/js-client-rest": "^1.12.0",
+    "ink": "^5.0.1",
+    "ink-text-input": "^6.0.0",
+    "neo4j-driver": "^5.27.0",
+    "react": "^18.3.1",
+    "redis": "^4.7.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/bun": "^1.2.0",
+    "@types/react": "^18.3.12",
+    "playwright": "^1.49.0",
+    "typescript": "^5.7.2"
+  }
+}
