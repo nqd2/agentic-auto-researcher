@@ -3,9 +3,14 @@ import { randomUUID } from "node:crypto";
 import { render } from "ink";
 import React from "react";
 import { readEnv } from "./env.js";
+import { shutdownMcp } from "./mcp/global.js";
 import { runResearchWorkflow } from "./research/workflow.js";
 import { ensureAarLayout } from "./setup.js";
 import { App } from "./ui/App.js";
+
+process.on("beforeExit", () => {
+  void shutdownMcp();
+});
 
 async function main(): Promise<void> {
   const cwd = process.cwd();

@@ -9,14 +9,33 @@ import React, {
   useState,
 } from "react";
 import { runAgentTurn } from "../QueryEngine.js";
-import { getUsageTotals } from "../cost/index.js";
+import { getUsageTotals, resetUsage } from "../cost/index.js";
 import type { EnvConfig } from "../env.js";
+import { appendHistory, clearHistory, getHistory } from "../history/index.js";
 import {
   type PermissionDecision,
   type PermissionRequest,
   getEmptyToolPermissionContext,
 } from "../permissions/index.js";
 import { runResearchWorkflow } from "../research/workflow.js";
+import type {
+  AskUserQuestion,
+  AskUserRequest,
+} from "../session/askUserTypes.js";
+import {
+  checkpointDepth,
+  clearCheckpoints,
+  popMany,
+  pushCheckpoint,
+} from "../session/checkpoints.js";
+import { compactSessionHistory } from "../session/compact.js";
+import { clearTodos, getTodos } from "../session/todos.js";
+import { getSkillByName, listSkills } from "../skills/loader.js";
+import {
+  addActiveSkill,
+  clearActiveSkills,
+  getActiveSkillNames,
+} from "../skills/sessionState.js";
 import { CC_DARK } from "./cc/theme.js";
 import { useDoublePress } from "./hooks/useDoublePress.js";
 
@@ -46,6 +65,20 @@ type Overlay =
       selectedIndex: number;
     };
 
+type AskFlowState = {
+  title?: string;
+  questions: AskUserQuestion[];
+  qIdx: number;
+  step: "mcq" | "text";
+  focusIdx: number;
+  selectedIds: string[];
+  textDraft: string;
+  answers: Record<string, unknown>;
+  pendingMcq?: string | string[];
+};
+
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 function isAbortError(e: unknown): boolean {
   return e instanceof DOMException && e.name === "AbortError";
 }
@@ -64,6 +97,9 @@ export function App(props: AppProps) {
   const [lastTool, setLastTool] = useState("");
   const [showTranscript, setShowTranscript] = useState(true);
   const [overlay, setOverlay] = useState<Overlay | null>(null);
+  const [askFlow, setAskFlow] = useState<AskFlowState | null>(null);
+  const [todos, setTodos] = useState(() => getTodos(props.sessionId));
+  const [spinIdx, setSpinIdx] = useState(0);
 
   const [exitPendingC, setExitPendingC] = useState(false);
   const [exitPendingD, setExitPendingD] = useState(false);
@@ -71,6 +107,7 @@ export function App(props: AppProps) {
   const permissionResolverRef = useRef<
     ((d: PermissionDecision) => void) | null
   >(null);
+  const askResolveRef = useRef<((s: string) => void) | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const inputHistoryRef = useRef<string[]>([]);
   const historyCursorRef = useRef<number | null>(null);
@@ -84,9 +121,40 @@ export function App(props: AppProps) {
     [msgs],
   );
 
+  useEffect(() => {
+    if (!todos.some((t) => t.status === "in_progress")) return undefined;
+    const id = setInterval(() => setSpinIdx((i) => i + 1), 400);
+    return () => clearInterval(id);
+  }, [todos]);
+
   const closeOverlay = useCallback(() => {
     setOverlay(null);
   }, []);
+
+  const onAskUser = useCallback((req: AskUserRequest) => {
+    return new Promise<string>((resolve) => {
+      askResolveRef.current = resolve;
+      const first = req.questions[0];
+      if (!first) {
+        resolve(JSON.stringify({ error: "no questions" }));
+        return;
+      }
+      setAskFlow({
+        title: req.title,
+        questions: req.questions,
+        qIdx: 0,
+        step: first.options?.length ? "mcq" : "text",
+        focusIdx: 0,
+        selectedIds: [],
+        textDraft: "",
+        answers: {},
+      });
+    });
+  }, []);
+
+  const onTodosUpdated = useCallback(() => {
+    setTodos(getTodos(props.sessionId));
+  }, [props.sessionId]);
 
   const onPermissionRequest = useCallback(
     (req: PermissionRequest): Promise<PermissionDecision> => {
@@ -117,7 +185,7 @@ export function App(props: AppProps) {
   const sendText = useCallback(
     async (rawText: string) => {
       const v = rawText.trim();
-      if (!v || busy || overlay) return;
+      if (!v || busy || overlay || askFlow) return;
 
       if (inputHistoryRef.current[inputHistoryRef.current.length - 1] !== v) {
         inputHistoryRef.current.push(v);
@@ -131,6 +199,199 @@ export function App(props: AppProps) {
       setBusy(true);
       setLastTool("");
 
+      if (v === "/clear") {
+        if (askResolveRef.current) {
+          askResolveRef.current(JSON.stringify({ cancelled: true }));
+          askResolveRef.current = null;
+        }
+        setAskFlow(null);
+        clearHistory(props.sessionId);
+        clearCheckpoints(props.sessionId);
+        clearActiveSkills(props.sessionId);
+        clearTodos(props.sessionId);
+        setTodos([]);
+        setMsgs([
+          {
+            id: randomUUID(),
+            role: "system",
+            text: `cwd: ${props.cwd} (session cleared)`,
+          },
+        ]);
+        setBusy(false);
+        return;
+      }
+
+      if (v === "/cost" || v.startsWith("/cost ")) {
+        const rest = v === "/cost" ? "" : v.slice("/cost ".length).trim();
+        if (rest === "reset") resetUsage();
+        const u = getUsageTotals();
+        push({
+          role: "user",
+          text: v,
+        });
+        push({
+          role: "assistant",
+          text:
+            rest === "reset"
+              ? `Usage counters reset.\nIn: ${u.promptTokens} tokens · Out: ${u.completionTokens} · ~$${u.totalCostUsd.toFixed(4)}`
+              : `Session usage (approx):\nIn: ${u.promptTokens} tokens\nOut: ${u.completionTokens} tokens\n~$${u.totalCostUsd.toFixed(4)}\n\nUse /cost reset to zero counters.`,
+        });
+        setBusy(false);
+        return;
+      }
+
+      if (v === "/skill" || v.startsWith("/skill ")) {
+        const rest = v === "/skill" ? "" : v.slice("/skill ".length).trim();
+        push({ role: "user", text: v });
+        if (!rest || rest === "list") {
+          const skills = await listSkills(props.aarRoot);
+          const active = getActiveSkillNames(props.sessionId);
+          const lines =
+            skills.length === 0
+              ? "No skills in .aar/skills/ yet."
+              : skills
+                  .map(
+                    (s) =>
+                      `- ${s.name}${s.description ? ` — ${s.description}` : ""}`,
+                  )
+                  .join("\n");
+          push({
+            role: "assistant",
+            text: `Skills:\n${lines}\n\nActive: ${active.length ? active.join(", ") : "(none)"}\n\nUse /skill <name> to activate. /skill clear removes active skills.`,
+          });
+        } else if (rest === "clear") {
+          clearActiveSkills(props.sessionId);
+          push({
+            role: "assistant",
+            text: "Active skills cleared for this session.",
+          });
+        } else {
+          const sk = await getSkillByName(props.aarRoot, rest);
+          if (!sk) {
+            push({
+              role: "assistant",
+              text: `Unknown skill «${rest}». Use /skill list.`,
+            });
+          } else {
+            addActiveSkill(props.sessionId, sk.name);
+            push({
+              role: "assistant",
+              text: `Skill «${sk.name}» added to active stack for this session.`,
+            });
+          }
+        }
+        setBusy(false);
+        return;
+      }
+
+      if (v === "/todos") {
+        push({ role: "user", text: v });
+        const list = getTodos(props.sessionId);
+        push({
+          role: "assistant",
+          text:
+            list.length === 0
+              ? "No todos yet. The model can use update_todos."
+              : list
+                  .map(
+                    (t) =>
+                      `- [${t.status}] ${t.id}: ${t.content.slice(0, 200)}`,
+                  )
+                  .join("\n"),
+        });
+        setBusy(false);
+        return;
+      }
+
+      if (v === "/rewind" || v.startsWith("/rewind ")) {
+        const n =
+          v === "/rewind"
+            ? 1
+            : Math.max(1, Number.parseInt(v.slice(8).trim(), 10) || 1);
+        const depth = checkpointDepth(props.sessionId);
+        if (depth === 0) {
+          push({ role: "user", text: v });
+          push({
+            role: "assistant",
+            text: "No checkpoints to rewind (send a message to the model first).",
+          });
+          setBusy(false);
+          return;
+        }
+        const steps = Math.min(n, depth);
+        const cp = popMany(props.sessionId, steps);
+        if (!cp) {
+          push({ role: "user", text: v });
+          push({ role: "assistant", text: "Rewind failed." });
+          setBusy(false);
+          return;
+        }
+        clearHistory(props.sessionId);
+        for (const m of cp.history) {
+          appendHistory(props.sessionId, m);
+        }
+        const rest = checkpointDepth(props.sessionId);
+        setMsgs([
+          ...cp.msgs.map((m) => ({
+            ...m,
+            id: randomUUID(),
+          })),
+          { id: randomUUID(), role: "user", text: v },
+          {
+            id: randomUUID(),
+            role: "assistant",
+            text: `Restored state (${steps} step(s) back). ${rest} checkpoint(s) remaining.`,
+          },
+        ]);
+        setBusy(false);
+        return;
+      }
+
+      if (v === "/compact") {
+        push({ role: "user", text: v });
+        if (!props.env.aarAllowCompact) {
+          push({
+            role: "assistant",
+            text: "Set AAR_ALLOW_COMPACT=true in .env to enable /compact (uses one extra model call).",
+          });
+          setBusy(false);
+          return;
+        }
+        if (!props.env.apiKey) {
+          push({ role: "assistant", text: "Set API_KEY in .env first." });
+          setBusy(false);
+          return;
+        }
+        try {
+          const { summary, hadContent } = await compactSessionHistory(
+            props.env,
+            props.sessionId,
+          );
+          clearCheckpoints(props.sessionId);
+          setMsgs([
+            {
+              id: randomUUID(),
+              role: "system",
+              text: `cwd: ${props.cwd}`,
+            },
+            { id: randomUUID(), role: "user", text: "/compact" },
+            {
+              id: randomUUID(),
+              role: "assistant",
+              text: hadContent ? `Session compacted.\n\n${summary}` : summary,
+            },
+          ]);
+        } catch (e) {
+          push({
+            role: "assistant",
+            text: `Compact failed: ${e instanceof Error ? e.message : String(e)}`,
+          });
+        }
+        setBusy(false);
+        return;
+      }
+
+      pushCheckpoint(props.sessionId, getHistory(props.sessionId), msgs);
       push({ role: "user", text: v });
 
       if (!props.env.apiKey) {
@@ -158,6 +419,8 @@ export function App(props: AppProps) {
             onTool: (n, s) => setLastTool(`${n}: ${s}`),
             onPermissionRequest,
             signal: ac.signal,
+            onAskUser,
+            onTodosUpdated,
           });
           push({ role: "assistant", text: acc || reply });
           return;
@@ -176,6 +439,8 @@ export function App(props: AppProps) {
           onTool: (n, s) => setLastTool(`${n}: ${s}`),
           onPermissionRequest,
           signal: ac.signal,
+          onAskUser,
+          onTodosUpdated,
         });
         push({ role: "assistant", text: acc || assistantText });
       } catch (e) {
@@ -192,8 +457,50 @@ export function App(props: AppProps) {
         setBusy(false);
       }
     },
-    [busy, onPermissionRequest, overlay, props, push],
+    [
+      askFlow,
+      busy,
+      msgs,
+      onAskUser,
+      onPermissionRequest,
+      onTodosUpdated,
+      overlay,
+      props,
+      push,
+    ],
   );
+
+  const submitAskText = useCallback(() => {
+    setAskFlow((prev) => {
+      if (!prev || prev.step !== "text") return prev;
+      const q = prev.questions[prev.qIdx];
+      if (!q) return prev;
+      let value: unknown = prev.textDraft;
+      if (prev.pendingMcq !== undefined) {
+        value = { picked: prev.pendingMcq, text: prev.textDraft };
+      }
+      const answers = { ...prev.answers, [q.id]: value };
+      if (prev.qIdx + 1 >= prev.questions.length) {
+        Promise.resolve().then(() => {
+          askResolveRef.current?.(JSON.stringify({ answers }));
+          askResolveRef.current = null;
+          setAskFlow(null);
+        });
+        return null;
+      }
+      const nq = prev.questions[prev.qIdx + 1];
+      return {
+        ...prev,
+        qIdx: prev.qIdx + 1,
+        step: nq.options?.length ? "mcq" : "text",
+        focusIdx: 0,
+        selectedIds: [],
+        textDraft: "",
+        answers,
+        pendingMcq: undefined,
+      };
+    });
+  }, []);
 
   const openMessageSelector = useCallback(() => {
     const options = userMessages.slice(-12).map((m) => ({
@@ -212,6 +519,102 @@ export function App(props: AppProps) {
     const ctrl = Boolean(key.ctrl);
     const shift = Boolean(key.shift);
     const meta = Boolean(key.meta);
+
+    if (askFlow) {
+      if (key.escape) {
+        askResolveRef.current?.(JSON.stringify({ cancelled: true }));
+        askResolveRef.current = null;
+        setAskFlow(null);
+        return;
+      }
+      if (askFlow.step === "text") {
+        return;
+      }
+      const q = askFlow.questions[askFlow.qIdx];
+      const opts = q?.options;
+      if (!opts?.length) {
+        return;
+      }
+      if (key.upArrow || ch === "k" || (ctrl && ch === "p")) {
+        setAskFlow((p) =>
+          p && p.step === "mcq"
+            ? { ...p, focusIdx: Math.max(0, p.focusIdx - 1) }
+            : p,
+        );
+        return;
+      }
+      if (key.downArrow || ch === "j" || (ctrl && ch === "n")) {
+        setAskFlow((p) => {
+          if (!p || p.step !== "mcq") return p;
+          const o = p.questions[p.qIdx]?.options ?? [];
+          return {
+            ...p,
+            focusIdx: Math.min(o.length - 1, p.focusIdx + 1),
+          };
+        });
+        return;
+      }
+      if (ch === " " && q.allow_multiple) {
+        setAskFlow((p) => {
+          if (!p || p.step !== "mcq") return p;
+          const o = p.questions[p.qIdx]?.options ?? [];
+          const id = o[p.focusIdx]?.id;
+          if (!id) return p;
+          const has = p.selectedIds.includes(id);
+          const selectedIds = has
+            ? p.selectedIds.filter((x) => x !== id)
+            : [...p.selectedIds, id];
+          return { ...p, selectedIds };
+        });
+        return;
+      }
+      if (key.return || key.enter) {
+        setAskFlow((prev) => {
+          if (!prev || prev.step !== "mcq") return prev;
+          const qq = prev.questions[prev.qIdx];
+          const o = qq.options ?? [];
+          let pick: string | string[];
+          if (qq.allow_multiple) {
+            if (prev.selectedIds.length === 0) return prev;
+            pick = [...prev.selectedIds];
+          } else {
+            const one = o[prev.focusIdx]?.id;
+            if (!one) return prev;
+            pick = one;
+          }
+          if (!qq.allow_free_text) {
+            const answers = { ...prev.answers, [qq.id]: pick };
+            if (prev.qIdx + 1 >= prev.questions.length) {
+              Promise.resolve().then(() => {
+                askResolveRef.current?.(JSON.stringify({ answers }));
+                askResolveRef.current = null;
+                setAskFlow(null);
+              });
+              return null;
+            }
+            const nq = prev.questions[prev.qIdx + 1];
+            return {
+              ...prev,
+              qIdx: prev.qIdx + 1,
+              step: nq.options?.length ? "mcq" : "text",
+              focusIdx: 0,
+              selectedIds: [],
+              textDraft: "",
+              answers,
+              pendingMcq: undefined,
+            };
+          }
+          return {
+            ...prev,
+            step: "text",
+            pendingMcq: pick,
+            textDraft: "",
+          };
+        });
+        return;
+      }
+      return;
+    }
 
     if (key.escape) {
       if (overlay?.kind === "permission") {
@@ -232,7 +635,7 @@ export function App(props: AppProps) {
       return;
     }
 
-    if (ctrl && ch === "r" && !overlay) {
+    if (ctrl && ch === "r" && !overlay && !askFlow) {
       openMessageSelector();
       return;
     }
@@ -246,6 +649,12 @@ export function App(props: AppProps) {
       }
       if (overlay?.kind === "messageSelector") {
         closeOverlay();
+        return;
+      }
+      if (askFlow) {
+        askResolveRef.current?.(JSON.stringify({ cancelled: true }));
+        askResolveRef.current = null;
+        setAskFlow(null);
         return;
       }
       if (tryInterruptAgent()) return;
@@ -338,7 +747,7 @@ export function App(props: AppProps) {
       return;
     }
 
-    if (!overlay && !busy) {
+    if (!overlay && !busy && !askFlow) {
       if (key.escape) {
         setInput("");
         historyCursorRef.current = null;
@@ -388,6 +797,40 @@ export function App(props: AppProps) {
           {usage.totalCostUsd.toFixed(4)}
         </Text>
       </Box>
+
+      {todos.length > 0 ? (
+        <Box
+          flexDirection="column"
+          marginTop={1}
+          borderStyle="round"
+          borderColor={CC_DARK.subtle}
+          paddingX={1}
+        >
+          <Text bold color={CC_DARK.brand}>
+            Todos
+          </Text>
+          {todos.map((t) => {
+            const spin =
+              t.status === "in_progress"
+                ? `${SPINNER_FRAMES[spinIdx % SPINNER_FRAMES.length]} `
+                : "";
+            const mark =
+              t.status === "completed"
+                ? "✓ "
+                : t.status === "cancelled"
+                  ? "✗ "
+                  : t.status === "in_progress"
+                    ? spin
+                    : "○ ";
+            return (
+              <Text key={t.id} color={CC_DARK.text} wrap="wrap">
+                {mark}
+                {t.content}
+              </Text>
+            );
+          })}
+        </Box>
+      ) : null}
 
       <Box flexDirection="column" marginTop={1} flexGrow={1}>
         {msgs.slice(-40).map((m) => (
@@ -522,7 +965,68 @@ export function App(props: AppProps) {
         </Box>
       ) : null}
 
-      {!overlay ? (
+      {askFlow ? (
+        <Box
+          flexDirection="column"
+          marginTop={1}
+          borderStyle="single"
+          borderColor={CC_DARK.suggestion}
+          paddingX={1}
+        >
+          {askFlow.title ? (
+            <Text bold color={CC_DARK.suggestion}>
+              {askFlow.title}
+            </Text>
+          ) : null}
+          <Text color={CC_DARK.text} wrap="wrap">
+            {askFlow.questions[askFlow.qIdx]?.prompt ?? ""}
+          </Text>
+          {askFlow.step === "mcq" &&
+          (askFlow.questions[askFlow.qIdx]?.options?.length ?? 0) > 0 ? (
+            <Box flexDirection="column" marginTop={1}>
+              {(askFlow.questions[askFlow.qIdx]?.options ?? []).map((o, i) => {
+                const multi =
+                  askFlow.questions[askFlow.qIdx]?.allow_multiple ?? false;
+                const picked =
+                  multi && askFlow.selectedIds.includes(o.id) ? "* " : "  ";
+                const cur = i === askFlow.focusIdx ? "> " : "  ";
+                return (
+                  <Text
+                    key={o.id}
+                    color={
+                      i === askFlow.focusIdx ? CC_DARK.text : CC_DARK.inactive
+                    }
+                    wrap="wrap"
+                  >
+                    {cur}
+                    {picked}
+                    {o.label}
+                  </Text>
+                );
+              })}
+              <Text color={CC_DARK.subtle} italic>
+                j/k · Space (multi) · Enter · Esc cancel
+              </Text>
+            </Box>
+          ) : (
+            <Box marginTop={1}>
+              <Text color={CC_DARK.subtle}>
+                Free text (Enter to submit, Esc cancel)
+              </Text>
+              <Box flexDirection="row">
+                <Text color={CC_DARK.brand}>{":"} </Text>
+                <TextInput
+                  value={askFlow.textDraft}
+                  onChange={(v) =>
+                    setAskFlow((s) => (s ? { ...s, textDraft: v } : null))
+                  }
+                  onSubmit={submitAskText}
+                />
+              </Box>
+            </Box>
+          )}
+        </Box>
+      ) : !overlay ? (
         <Box
           flexDirection="row"
           marginTop={1}

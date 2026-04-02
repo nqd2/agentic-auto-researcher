@@ -18,4 +18,5 @@ export const AAR_SUBDIRS = [
   "plans",
   "traces",
   "logs",
+  "skills",
 ] as const;

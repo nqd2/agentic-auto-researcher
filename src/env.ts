@@ -3,6 +3,10 @@ export type EnvConfig = {
   apiKey: string;
   providerStyle: "openai" | "anthropic";
   model: string;
+  /** Allow /compact (extra LLM call to summarize session history). */
+  aarAllowCompact: boolean;
+  /** Inject git status + recent files into system prompt each turn. */
+  aarPassiveContext: boolean;
   chromeExecutablePath?: string;
   chromeUserProfile?: string;
   redisUrl?: string;
@@ -21,6 +25,9 @@ export function readEnv(): EnvConfig {
     apiKey: Bun.env.API_KEY ?? "",
     providerStyle: providerStyle === "anthropic" ? "anthropic" : "openai",
     model: Bun.env.MODEL ?? "gpt-4o-mini",
+    aarAllowCompact: (Bun.env.AAR_ALLOW_COMPACT ?? "").toLowerCase() === "true",
+    aarPassiveContext:
+      (Bun.env.AAR_PASSIVE_CONTEXT ?? "true").toLowerCase() !== "false",
     chromeExecutablePath: Bun.env.CHROME_EXECUTABLE_PATH,
     chromeUserProfile: Bun.env.CHROME_USER_PROFILE,
     redisUrl: Bun.env.REDIS_URL,

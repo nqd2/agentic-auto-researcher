@@ -1,4 +1,10 @@
 import type { ZodType } from "zod";
+import type {
+  PermissionDecision,
+  PermissionRequest,
+  ToolPermissionContext,
+} from "./permissions/index.js";
+import type { AskUserRequest } from "./session/askUserTypes.js";
 
 export type JsonSchema = {
   type: "object";
@@ -18,6 +24,14 @@ export type ToolRunContext = {
   cwd: string;
   sessionId: string;
   aarRoot: string;
+  permission?: ToolPermissionContext;
+  onPermissionRequest?: (r: PermissionRequest) => Promise<PermissionDecision>;
+  onTool?: (name: string, summary: string) => void;
+  onStream?: (chunk: string) => void;
+  signal?: AbortSignal;
+  /** Interactive TUI: ask user multi-choice / free-text; return JSON string for tool result. */
+  onAskUser?: (req: AskUserRequest) => Promise<string>;
+  onTodosUpdated?: () => void;
 };
 
 export function toolToOpenAI(t: ToolDefinition): {

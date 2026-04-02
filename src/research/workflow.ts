@@ -10,6 +10,7 @@ import {
   type PermissionRequest,
   getEmptyToolPermissionContext,
 } from "../permissions/index.js";
+import type { AskUserRequest } from "../session/askUserTypes.js";
 
 export type ResearchRunOptions = {
   cwd: string;
@@ -21,6 +22,8 @@ export type ResearchRunOptions = {
   onTool?: (name: string, summary: string) => void;
   onPermissionRequest?: (req: PermissionRequest) => Promise<PermissionDecision>;
   signal?: AbortSignal;
+  onAskUser?: (req: AskUserRequest) => Promise<string>;
+  onTodosUpdated?: () => void;
 };
 
 export async function runResearchWorkflow(
@@ -30,7 +33,7 @@ export async function runResearchWorkflow(
     "Clarify scope and success criteria",
     "Collect sources (web_search, optional playwright_navigate)",
     "Summarize findings; store key chunks in qdrant_upsert if enabled",
-    "If code involved: read_file / write_file / bash tests; log under .aar/experiments/",
+    "If code involved: read_file / patch_file / write_file / bash tests; log under .aar/experiments/",
     "self_critic then report_write to .aar/reports/",
   ];
   const planPath = await writeResearchPlan(
@@ -64,6 +67,8 @@ export async function runResearchWorkflow(
     onTool: opt.onTool,
     onPermissionRequest: opt.onPermissionRequest,
     signal: opt.signal,
+    onAskUser: opt.onAskUser,
+    onTodosUpdated: opt.onTodosUpdated,
   });
 
   await appendTrace(opt.aarRoot, {

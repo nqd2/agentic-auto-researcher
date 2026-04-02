@@ -18,6 +18,7 @@ const DANGEROUS = new Set([
   "playwright_navigate",
   "playwright_click",
   "git_commit",
+  "shell_kill",
 ]);
 
 export async function checkToolPermission(
