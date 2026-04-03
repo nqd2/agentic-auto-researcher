@@ -11,8 +11,8 @@ import type { EnvConfig } from "./env.js";
 import { appendHistory, getHistory } from "./history/index.js";
 import { getMcpTools } from "./mcp/global.js";
 import {
-  type PermissionDecision,
   type PermissionRequest,
+  type PermissionUiResult,
   type ToolPermissionContext,
   checkToolPermission,
 } from "./permissions/index.js";
@@ -35,7 +35,7 @@ export type QueryEngineOptions = {
   onStream?: (chunk: string) => void;
   onTool?: (name: string, summary: string) => void;
   /** When tool permission should ask the user (interactive UI). */
-  onPermissionRequest?: (req: PermissionRequest) => Promise<PermissionDecision>;
+  onPermissionRequest?: (req: PermissionRequest) => Promise<PermissionUiResult>;
   /** Abort in-flight LLM / tool loop (Ctrl+C interrupt). */
   signal?: AbortSignal;
   onAskUser?: (req: AskUserRequest) => Promise<string>;
@@ -171,11 +171,13 @@ export type IsolatedAgentTurnOptions = {
   sessionId: string;
   permission: ToolPermissionContext;
   allowedToolNames: string[];
+  /** Overrides default sub-agent system prompt (e.g. reviewer role). */
+  systemPrompt?: string;
   mcpExtraTools?: ToolDefinition[];
   maxIterations?: number;
   onStream?: (chunk: string) => void;
   onTool?: (name: string, summary: string) => void;
-  onPermissionRequest?: (req: PermissionRequest) => Promise<PermissionDecision>;
+  onPermissionRequest?: (req: PermissionRequest) => Promise<PermissionUiResult>;
   signal?: AbortSignal;
   onAskUser?: (req: AskUserRequest) => Promise<string>;
   onTodosUpdated?: () => void;
@@ -195,8 +197,9 @@ export async function runIsolatedAgentTurn(
   }
   const tools = registry.map(toolToOpenAI);
   const tmap = toolMap(registry);
+  const system = opt.systemPrompt ?? SUBAGENT_SYSTEM;
   const messages: LlmMessage[] = [
-    { role: "system", content: SUBAGENT_SYSTEM },
+    { role: "system", content: system },
     { role: "user", content: userText },
   ];
   let lastAssistant = "";

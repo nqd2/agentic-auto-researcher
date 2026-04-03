@@ -12,10 +12,10 @@ import { runAgentTurn } from "../QueryEngine.js";
 import { getUsageTotals, resetUsage } from "../cost/index.js";
 import type { EnvConfig } from "../env.js";
 import { appendHistory, clearHistory, getHistory } from "../history/index.js";
-import {
-  type PermissionDecision,
-  type PermissionRequest,
-  getEmptyToolPermissionContext,
+import type {
+  PermissionRequest,
+  PermissionUiResult,
+  ToolPermissionContext,
 } from "../permissions/index.js";
 import { runResearchWorkflow } from "../research/workflow.js";
 import type {
@@ -53,11 +53,13 @@ export type AppProps = {
   initialTopic?: string;
 };
 
+type PermissionChoice = 0 | 1 | 2;
+
 type Overlay =
   | {
       kind: "permission";
       req: PermissionRequest;
-      choice: 0 | 1;
+      choice: PermissionChoice;
     }
   | {
       kind: "messageSelector";
@@ -78,6 +80,8 @@ type AskFlowState = {
 };
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+const MAX_PROMPT_QUEUE = 20;
 
 function isAbortError(e: unknown): boolean {
   return e instanceof DOMException && e.name === "AbortError";
@@ -100,12 +104,19 @@ export function App(props: AppProps) {
   const [askFlow, setAskFlow] = useState<AskFlowState | null>(null);
   const [todos, setTodos] = useState(() => getTodos(props.sessionId));
   const [spinIdx, setSpinIdx] = useState(0);
+  const [queuedPromptCount, setQueuedPromptCount] = useState(0);
 
   const [exitPendingC, setExitPendingC] = useState(false);
   const [exitPendingD, setExitPendingD] = useState(false);
 
+  const sessionPermissionRef = useRef<ToolPermissionContext>({
+    mode: "default",
+    alwaysAllow: new Set<string>(),
+  });
+  const promptQueueRef = useRef<string[]>([]);
+
   const permissionResolverRef = useRef<
-    ((d: PermissionDecision) => void) | null
+    ((d: PermissionUiResult) => void) | null
   >(null);
   const askResolveRef = useRef<((s: string) => void) | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -157,7 +168,7 @@ export function App(props: AppProps) {
   }, [props.sessionId]);
 
   const onPermissionRequest = useCallback(
-    (req: PermissionRequest): Promise<PermissionDecision> => {
+    (req: PermissionRequest): Promise<PermissionUiResult> => {
       return new Promise((resolve) => {
         permissionResolverRef.current = resolve;
         setOverlay({ kind: "permission", req, choice: 0 });
@@ -185,7 +196,32 @@ export function App(props: AppProps) {
   const sendText = useCallback(
     async (rawText: string) => {
       const v = rawText.trim();
-      if (!v || busy || overlay || askFlow) return;
+      if (!v || overlay || askFlow) return;
+
+      if (busy) {
+        if (promptQueueRef.current.length >= MAX_PROMPT_QUEUE) {
+          push({
+            role: "system",
+            text: `Prompt queue full (max ${MAX_PROMPT_QUEUE}). Wait for the agent to finish.`,
+          });
+          return;
+        }
+        promptQueueRef.current.push(v);
+        setQueuedPromptCount(promptQueueRef.current.length);
+        if (inputHistoryRef.current[inputHistoryRef.current.length - 1] !== v) {
+          inputHistoryRef.current.push(v);
+          if (inputHistoryRef.current.length > 100) {
+            inputHistoryRef.current.shift();
+          }
+        }
+        historyCursorRef.current = null;
+        setInput("");
+        push({
+          role: "system",
+          text: `Queued (${promptQueueRef.current.length} in queue). Will run after the current turn finishes.`,
+        });
+        return;
+      }
 
       if (inputHistoryRef.current[inputHistoryRef.current.length - 1] !== v) {
         inputHistoryRef.current.push(v);
@@ -199,220 +235,234 @@ export function App(props: AppProps) {
       setBusy(true);
       setLastTool("");
 
-      if (v === "/clear") {
-        if (askResolveRef.current) {
-          askResolveRef.current(JSON.stringify({ cancelled: true }));
-          askResolveRef.current = null;
-        }
-        setAskFlow(null);
-        clearHistory(props.sessionId);
-        clearCheckpoints(props.sessionId);
-        clearActiveSkills(props.sessionId);
-        clearTodos(props.sessionId);
-        setTodos([]);
-        setMsgs([
-          {
-            id: randomUUID(),
-            role: "system",
-            text: `cwd: ${props.cwd} (session cleared)`,
-          },
-        ]);
-        setBusy(false);
-        return;
-      }
-
-      if (v === "/cost" || v.startsWith("/cost ")) {
-        const rest = v === "/cost" ? "" : v.slice("/cost ".length).trim();
-        if (rest === "reset") resetUsage();
-        const u = getUsageTotals();
-        push({
-          role: "user",
-          text: v,
-        });
-        push({
-          role: "assistant",
-          text:
-            rest === "reset"
-              ? `Usage counters reset.\nIn: ${u.promptTokens} tokens · Out: ${u.completionTokens} · ~$${u.totalCostUsd.toFixed(4)}`
-              : `Session usage (approx):\nIn: ${u.promptTokens} tokens\nOut: ${u.completionTokens} tokens\n~$${u.totalCostUsd.toFixed(4)}\n\nUse /cost reset to zero counters.`,
-        });
-        setBusy(false);
-        return;
-      }
-
-      if (v === "/skill" || v.startsWith("/skill ")) {
-        const rest = v === "/skill" ? "" : v.slice("/skill ".length).trim();
-        push({ role: "user", text: v });
-        if (!rest || rest === "list") {
-          const skills = await listSkills(props.aarRoot);
-          const active = getActiveSkillNames(props.sessionId);
-          const lines =
-            skills.length === 0
-              ? "No skills in .aar/skills/ yet."
-              : skills
-                  .map(
-                    (s) =>
-                      `- ${s.name}${s.description ? ` — ${s.description}` : ""}`,
-                  )
-                  .join("\n");
-          push({
-            role: "assistant",
-            text: `Skills:\n${lines}\n\nActive: ${active.length ? active.join(", ") : "(none)"}\n\nUse /skill <name> to activate. /skill clear removes active skills.`,
-          });
-        } else if (rest === "clear") {
-          clearActiveSkills(props.sessionId);
-          push({
-            role: "assistant",
-            text: "Active skills cleared for this session.",
-          });
-        } else {
-          const sk = await getSkillByName(props.aarRoot, rest);
-          if (!sk) {
-            push({
-              role: "assistant",
-              text: `Unknown skill «${rest}». Use /skill list.`,
-            });
-          } else {
-            addActiveSkill(props.sessionId, sk.name);
-            push({
-              role: "assistant",
-              text: `Skill «${sk.name}» added to active stack for this session.`,
-            });
+      try {
+        if (v === "/clear") {
+          if (askResolveRef.current) {
+            askResolveRef.current(JSON.stringify({ cancelled: true }));
+            askResolveRef.current = null;
           }
-        }
-        setBusy(false);
-        return;
-      }
-
-      if (v === "/todos") {
-        push({ role: "user", text: v });
-        const list = getTodos(props.sessionId);
-        push({
-          role: "assistant",
-          text:
-            list.length === 0
-              ? "No todos yet. The model can use update_todos."
-              : list
-                  .map(
-                    (t) =>
-                      `- [${t.status}] ${t.id}: ${t.content.slice(0, 200)}`,
-                  )
-                  .join("\n"),
-        });
-        setBusy(false);
-        return;
-      }
-
-      if (v === "/rewind" || v.startsWith("/rewind ")) {
-        const n =
-          v === "/rewind"
-            ? 1
-            : Math.max(1, Number.parseInt(v.slice(8).trim(), 10) || 1);
-        const depth = checkpointDepth(props.sessionId);
-        if (depth === 0) {
-          push({ role: "user", text: v });
-          push({
-            role: "assistant",
-            text: "No checkpoints to rewind (send a message to the model first).",
-          });
-          setBusy(false);
-          return;
-        }
-        const steps = Math.min(n, depth);
-        const cp = popMany(props.sessionId, steps);
-        if (!cp) {
-          push({ role: "user", text: v });
-          push({ role: "assistant", text: "Rewind failed." });
-          setBusy(false);
-          return;
-        }
-        clearHistory(props.sessionId);
-        for (const m of cp.history) {
-          appendHistory(props.sessionId, m);
-        }
-        const rest = checkpointDepth(props.sessionId);
-        setMsgs([
-          ...cp.msgs.map((m) => ({
-            ...m,
-            id: randomUUID(),
-          })),
-          { id: randomUUID(), role: "user", text: v },
-          {
-            id: randomUUID(),
-            role: "assistant",
-            text: `Restored state (${steps} step(s) back). ${rest} checkpoint(s) remaining.`,
-          },
-        ]);
-        setBusy(false);
-        return;
-      }
-
-      if (v === "/compact") {
-        push({ role: "user", text: v });
-        if (!props.env.aarAllowCompact) {
-          push({
-            role: "assistant",
-            text: "Set AAR_ALLOW_COMPACT=true in .env to enable /compact (uses one extra model call).",
-          });
-          setBusy(false);
-          return;
-        }
-        if (!props.env.apiKey) {
-          push({ role: "assistant", text: "Set API_KEY in .env first." });
-          setBusy(false);
-          return;
-        }
-        try {
-          const { summary, hadContent } = await compactSessionHistory(
-            props.env,
-            props.sessionId,
-          );
+          setAskFlow(null);
+          promptQueueRef.current = [];
+          setQueuedPromptCount(0);
+          sessionPermissionRef.current.alwaysAllow?.clear();
+          clearHistory(props.sessionId);
           clearCheckpoints(props.sessionId);
+          clearActiveSkills(props.sessionId);
+          clearTodos(props.sessionId);
+          setTodos([]);
           setMsgs([
             {
               id: randomUUID(),
               role: "system",
-              text: `cwd: ${props.cwd}`,
+              text: `cwd: ${props.cwd} (session cleared)`,
             },
-            { id: randomUUID(), role: "user", text: "/compact" },
+          ]);
+          return;
+        }
+
+        if (v === "/cost" || v.startsWith("/cost ")) {
+          const rest = v === "/cost" ? "" : v.slice("/cost ".length).trim();
+          if (rest === "reset") resetUsage();
+          const u = getUsageTotals();
+          push({
+            role: "user",
+            text: v,
+          });
+          push({
+            role: "assistant",
+            text:
+              rest === "reset"
+                ? `Usage counters reset.\nIn: ${u.promptTokens} tokens · Out: ${u.completionTokens} · ~$${u.totalCostUsd.toFixed(4)}`
+                : `Session usage (approx):\nIn: ${u.promptTokens} tokens\nOut: ${u.completionTokens} tokens\n~$${u.totalCostUsd.toFixed(4)}\n\nUse /cost reset to zero counters.`,
+          });
+          return;
+        }
+
+        if (v === "/skill" || v.startsWith("/skill ")) {
+          const rest = v === "/skill" ? "" : v.slice("/skill ".length).trim();
+          push({ role: "user", text: v });
+          if (!rest || rest === "list") {
+            const skills = await listSkills(props.aarRoot);
+            const active = getActiveSkillNames(props.sessionId);
+            const lines =
+              skills.length === 0
+                ? "No skills in .aar/skills/ yet."
+                : skills
+                    .map(
+                      (s) =>
+                        `- ${s.name}${s.description ? ` — ${s.description}` : ""}`,
+                    )
+                    .join("\n");
+            push({
+              role: "assistant",
+              text: `Skills:\n${lines}\n\nActive: ${active.length ? active.join(", ") : "(none)"}\n\nUse /skill <name> to activate. /skill clear removes active skills.`,
+            });
+          } else if (rest === "clear") {
+            clearActiveSkills(props.sessionId);
+            push({
+              role: "assistant",
+              text: "Active skills cleared for this session.",
+            });
+          } else {
+            const sk = await getSkillByName(props.aarRoot, rest);
+            if (!sk) {
+              push({
+                role: "assistant",
+                text: `Unknown skill «${rest}». Use /skill list.`,
+              });
+            } else {
+              addActiveSkill(props.sessionId, sk.name);
+              push({
+                role: "assistant",
+                text: `Skill «${sk.name}» added to active stack for this session.`,
+              });
+            }
+          }
+          return;
+        }
+
+        if (v === "/todos") {
+          push({ role: "user", text: v });
+          const list = getTodos(props.sessionId);
+          push({
+            role: "assistant",
+            text:
+              list.length === 0
+                ? "No todos yet. The model can use update_todos."
+                : list
+                    .map(
+                      (t) =>
+                        `- [${t.status}] ${t.id}: ${t.content.slice(0, 200)}`,
+                    )
+                    .join("\n"),
+          });
+          return;
+        }
+
+        if (v === "/rewind" || v.startsWith("/rewind ")) {
+          const n =
+            v === "/rewind"
+              ? 1
+              : Math.max(1, Number.parseInt(v.slice(8).trim(), 10) || 1);
+          const depth = checkpointDepth(props.sessionId);
+          if (depth === 0) {
+            push({ role: "user", text: v });
+            push({
+              role: "assistant",
+              text: "No checkpoints to rewind (send a message to the model first).",
+            });
+            return;
+          }
+          const steps = Math.min(n, depth);
+          const cp = popMany(props.sessionId, steps);
+          if (!cp) {
+            push({ role: "user", text: v });
+            push({ role: "assistant", text: "Rewind failed." });
+            return;
+          }
+          clearHistory(props.sessionId);
+          for (const m of cp.history) {
+            appendHistory(props.sessionId, m);
+          }
+          const rest = checkpointDepth(props.sessionId);
+          setMsgs([
+            ...cp.msgs.map((m) => ({
+              ...m,
+              id: randomUUID(),
+            })),
+            { id: randomUUID(), role: "user", text: v },
             {
               id: randomUUID(),
               role: "assistant",
-              text: hadContent ? `Session compacted.\n\n${summary}` : summary,
+              text: `Restored state (${steps} step(s) back). ${rest} checkpoint(s) remaining.`,
             },
           ]);
-        } catch (e) {
-          push({
-            role: "assistant",
-            text: `Compact failed: ${e instanceof Error ? e.message : String(e)}`,
-          });
+          return;
         }
-        setBusy(false);
-        return;
-      }
 
-      pushCheckpoint(props.sessionId, getHistory(props.sessionId), msgs);
-      push({ role: "user", text: v });
+        if (v === "/compact") {
+          push({ role: "user", text: v });
+          if (!props.env.aarAllowCompact) {
+            push({
+              role: "assistant",
+              text: "Set AAR_ALLOW_COMPACT=true in .env to enable /compact (uses one extra model call).",
+            });
+            return;
+          }
+          if (!props.env.apiKey) {
+            push({ role: "assistant", text: "Set API_KEY in .env first." });
+            return;
+          }
+          try {
+            const { summary, hadContent } = await compactSessionHistory(
+              props.env,
+              props.sessionId,
+            );
+            clearCheckpoints(props.sessionId);
+            setMsgs([
+              {
+                id: randomUUID(),
+                role: "system",
+                text: `cwd: ${props.cwd}`,
+              },
+              { id: randomUUID(), role: "user", text: "/compact" },
+              {
+                id: randomUUID(),
+                role: "assistant",
+                text: hadContent ? `Session compacted.\n\n${summary}` : summary,
+              },
+            ]);
+          } catch (e) {
+            push({
+              role: "assistant",
+              text: `Compact failed: ${e instanceof Error ? e.message : String(e)}`,
+            });
+          }
+          return;
+        }
 
-      if (!props.env.apiKey) {
-        push({ role: "assistant", text: "Set API_KEY in .env first." });
-        setBusy(false);
-        return;
-      }
+        pushCheckpoint(props.sessionId, getHistory(props.sessionId), msgs);
+        push({ role: "user", text: v });
 
-      const ac = new AbortController();
-      abortRef.current = ac;
+        if (!props.env.apiKey) {
+          push({ role: "assistant", text: "Set API_KEY in .env first." });
+          return;
+        }
 
-      try {
-        if (v.startsWith("/research ")) {
-          const topic = v.slice("/research ".length).trim();
+        const ac = new AbortController();
+        abortRef.current = ac;
+
+        try {
+          if (v.startsWith("/research ")) {
+            const topic = v.slice("/research ".length).trim();
+            let acc = "";
+            const { reply } = await runResearchWorkflow({
+              cwd: props.cwd,
+              aarRoot: props.aarRoot,
+              env: props.env,
+              sessionId: props.sessionId,
+              topic,
+              permission: sessionPermissionRef.current,
+              onStream: (s) => {
+                acc += s;
+              },
+              onTool: (n, s) => setLastTool(`${n}: ${s}`),
+              onPermissionRequest,
+              signal: ac.signal,
+              onAskUser,
+              onTodosUpdated,
+            });
+            push({ role: "assistant", text: acc || reply });
+            return;
+          }
+
           let acc = "";
-          const { reply } = await runResearchWorkflow({
+          const { assistantText } = await runAgentTurn(v, {
             cwd: props.cwd,
             aarRoot: props.aarRoot,
             env: props.env,
             sessionId: props.sessionId,
-            topic,
+            permission: sessionPermissionRef.current,
             onStream: (s) => {
               acc += s;
             },
@@ -422,39 +472,27 @@ export function App(props: AppProps) {
             onAskUser,
             onTodosUpdated,
           });
-          push({ role: "assistant", text: acc || reply });
-          return;
-        }
-
-        let acc = "";
-        const { assistantText } = await runAgentTurn(v, {
-          cwd: props.cwd,
-          aarRoot: props.aarRoot,
-          env: props.env,
-          sessionId: props.sessionId,
-          permission: getEmptyToolPermissionContext(),
-          onStream: (s) => {
-            acc += s;
-          },
-          onTool: (n, s) => setLastTool(`${n}: ${s}`),
-          onPermissionRequest,
-          signal: ac.signal,
-          onAskUser,
-          onTodosUpdated,
-        });
-        push({ role: "assistant", text: acc || assistantText });
-      } catch (e) {
-        if (isAbortError(e)) {
-          push({ role: "assistant", text: "[Interrupted]" });
-        } else {
-          push({
-            role: "assistant",
-            text: `Error: ${e instanceof Error ? e.message : String(e)}`,
-          });
+          push({ role: "assistant", text: acc || assistantText });
+        } catch (e) {
+          if (isAbortError(e)) {
+            push({ role: "assistant", text: "[Interrupted]" });
+          } else {
+            push({
+              role: "assistant",
+              text: `Error: ${e instanceof Error ? e.message : String(e)}`,
+            });
+          }
         }
       } finally {
         abortRef.current = null;
         setBusy(false);
+        const next = promptQueueRef.current.shift();
+        setQueuedPromptCount(promptQueueRef.current.length);
+        if (next) {
+          queueMicrotask(() => {
+            void sendText(next);
+          });
+        }
       }
     },
     [
@@ -670,18 +708,33 @@ export function App(props: AppProps) {
     if (overlay?.kind === "permission") {
       if (key.upArrow || ch === "k" || (ctrl && ch === "p")) {
         setOverlay((prev) =>
-          prev?.kind === "permission" ? { ...prev, choice: 0 } : prev,
+          prev?.kind === "permission"
+            ? {
+                ...prev,
+                choice: ((prev.choice + 2) % 3) as PermissionChoice,
+              }
+            : prev,
         );
         return;
       }
       if (key.downArrow || ch === "j" || (ctrl && ch === "n")) {
         setOverlay((prev) =>
-          prev?.kind === "permission" ? { ...prev, choice: 1 } : prev,
+          prev?.kind === "permission"
+            ? {
+                ...prev,
+                choice: ((prev.choice + 1) % 3) as PermissionChoice,
+              }
+            : prev,
         );
         return;
       }
       if (key.return || key.enter) {
-        const d = overlay.choice === 0 ? "allow" : "deny";
+        const d: PermissionUiResult =
+          overlay.choice === 0
+            ? "allow"
+            : overlay.choice === 1
+              ? "deny"
+              : "always_allow";
         permissionResolverRef.current?.(d);
         permissionResolverRef.current = null;
         closeOverlay();
@@ -890,7 +943,10 @@ export function App(props: AppProps) {
       ) : null}
 
       {busy ? (
-        <Text color={CC_DARK.warning}>Working… (Ctrl+C to interrupt)</Text>
+        <Text color={CC_DARK.warning}>
+          Working… (Ctrl+C to interrupt)
+          {queuedPromptCount > 0 ? ` · ${queuedPromptCount} queued` : ""}
+        </Text>
       ) : null}
 
       {(exitPendingC || exitPendingD) && !busy ? (
@@ -919,12 +975,17 @@ export function App(props: AppProps) {
             <Text
               color={overlay.choice === 0 ? CC_DARK.text : CC_DARK.inactive}
             >
-              {overlay.choice === 0 ? "> " : "  "}Allow
+              {overlay.choice === 0 ? "> " : "  "}Allow once
             </Text>
             <Text
               color={overlay.choice === 1 ? CC_DARK.text : CC_DARK.inactive}
             >
               {overlay.choice === 1 ? "> " : "  "}Deny
+            </Text>
+            <Text
+              color={overlay.choice === 2 ? CC_DARK.text : CC_DARK.inactive}
+            >
+              {overlay.choice === 2 ? "> " : "  "}Always allow (this tool)
             </Text>
           </Box>
           <Text color={CC_DARK.subtle} italic>

@@ -1,17 +1,21 @@
 {
   "name": "agentic-auto-researcher",
   "version": "0.1.0",
-  "private": true,
+  "description": "Agentic Auto-Researcher CLI",
+  "private": false,
   "type": "module",
   "bin": {
-    "aar": "./src/cli.ts"
+    "aar": "./bin/aar.cjs",
+    "agentic-auto-researcher": "./bin/aar.cjs"
   },
+  "files": ["bin", "dist"],
   "scripts": {
     "start": "bun run src/cli.ts start",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "test": "bun test",
-    "build": "bun build src/cli.ts --outfile aar"
+    "build": "bun build src/cli.ts --target bun --packages external --outfile dist/cli.js --minify && bunx javascript-obfuscator dist/cli.js -o dist/cli.obf.js || echo skip obfuscation"
+  , "prepack": "npm run build"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

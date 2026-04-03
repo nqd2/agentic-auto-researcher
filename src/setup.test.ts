@@ -41,4 +41,26 @@ describe("permissions", () => {
     });
     expect(d).toBe("deny");
   });
+
+  test("alwaysAllow skips prompt for dangerous tools", async () => {
+    const alwaysAllow = new Set<string>(["bash"]);
+    const ctx = { ...getEmptyToolPermissionContext(), alwaysAllow };
+    const d = await checkToolPermission(ctx, {
+      toolName: "bash",
+      inputSummary: "ls",
+    });
+    expect(d).toBe("allow");
+  });
+
+  test("always_allow from UI adds tool to set", async () => {
+    const ctx = getEmptyToolPermissionContext();
+    ctx.alwaysAllow = new Set();
+    const d = await checkToolPermission(
+      ctx,
+      { toolName: "bash", inputSummary: "ls" },
+      async () => "always_allow",
+    );
+    expect(d).toBe("allow");
+    expect(ctx.alwaysAllow.has("bash")).toBe(true);
+  });
 });

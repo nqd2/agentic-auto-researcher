@@ -1,7 +1,7 @@
 import type { ZodType } from "zod";
 import type {
-  PermissionDecision,
   PermissionRequest,
+  PermissionUiResult,
   ToolPermissionContext,
 } from "./permissions/index.js";
 import type { AskUserRequest } from "./session/askUserTypes.js";
@@ -25,7 +25,7 @@ export type ToolRunContext = {
   sessionId: string;
   aarRoot: string;
   permission?: ToolPermissionContext;
-  onPermissionRequest?: (r: PermissionRequest) => Promise<PermissionDecision>;
+  onPermissionRequest?: (r: PermissionRequest) => Promise<PermissionUiResult>;
   onTool?: (name: string, summary: string) => void;
   onStream?: (chunk: string) => void;
   signal?: AbortSignal;
